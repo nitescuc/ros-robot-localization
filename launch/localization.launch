@@ -1,0 +1,46 @@
+<launch>
+    <include file="$(find open_mower)/launch/include/_lidar.launch" />
+
+    <arg name="map_file" default="/root/.ros/map.yaml"/> 
+    <node name="map_server" pkg="map_server" type="map_server" args="$(arg map_file)" />
+
+    <node pkg="robot_localization_om" type="odometry" name="odom_converter" required="true" output="screen">
+        <rosparam command="load" file="$(find open_mower)/params/ekf/odometry_converter.yaml" />
+        <param name="antenna_offset_x" value="$(env OM_ANTENNA_OFFSET_X)"/>
+        <param name="antenna_offset_y" value="$(env OM_ANTENNA_OFFSET_Y)"/>
+    </node>
+    <node pkg="topic_tools" type="throttle" name="throttle" args="messages /odom_converter/pose 0.01 /amcl_initial" output="screen" />
+
+    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_localization_odom" output="screen"> 
+        <remap from="odometry/filtered" to="odometry_odom/filtered"/>
+        <remap from="set_pose" to="odometry_odom/set_pose"/>
+        <rosparam command="load" file="$(find open_mower)/params/ekf/robot_localization_odom.yaml" />
+        <!-- <rosparam param="initial_state">[1.3,  -0.1,  0.0,
+                                 0.0,  0.0,  4.71,
+                                 0.0,  0.0,  0.0,
+                                 0.0,  0.0,  0.0,
+                                 0.0,  0.0,  0.0]</rosparam> -->
+    </node>
+    <node pkg="robot_localization" type="ekf_localization_node" name="ekf_localization_map" output="screen"> 
+        <remap from="odometry/filtered" to="odometry_map/filtered"/>
+        <remap from="set_pose" to="odometry_map/set_pose"/>
+        <rosparam command="load" file="$(find open_mower)/params/ekf/robot_localization_map.yaml" />
+        <!-- <rosparam param="initial_state">[1.3,  -0.1,  0.0,
+                                 0.0,  0.0,  4.71,
+                                 0.0,  0.0,  0.0,
+                                 0.0,  0.0,  0.0,
+                                 0.0,  0.0,  0.0]</rosparam> -->
+    </node>
+
+    <group if="$(eval env('OM_SLAM')=='ekf_amcl')">
+        <node pkg="amcl" type="amcl" name="amcl">
+            <remap from="initialpose" to="amcl_initial"/>
+            <rosparam command="load" file="$(find open_mower)/params/amcl.yaml" />
+        </node>
+    </group>
+    <group if="$(eval env('OM_SLAM')=='ekf_hector')">
+        <node pkg="hector_mapping" type="hector_mapping" name="hector_mapping_localization" output="screen">
+            <rosparam file="$(find open_mower)/params/hector_localization.yaml" command="load" />
+        </node>
+    </group>
+</launch>
