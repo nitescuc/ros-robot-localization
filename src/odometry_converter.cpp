@@ -7,8 +7,8 @@
 #include <sensor_msgs/Imu.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
-#include "mower_utils/GPSControlSrv.h"
-#include "mower_utils/SetPoseSrv.h"
+#include "robot_localization_om/GPSControlSrv.h"
+#include "robot_localization_om/SetPoseSrv.h"
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/transform_listener.h>
 #include "robot_localization/SetPose.h"
@@ -37,6 +37,10 @@ double max_covariance = 0.5;
 double acceleration_covariance_factor = 100.0;
 double yaw_covariance_factor = 100.0;
 double amcl_covariance_factor = 10.0;
+double fully_fixed_wait_time = 20.0; // seconds
+bool useOdomFrame = false;
+double fixed_yaw_covariance = 0.0001;
+double fixed_acceleration_covariance = 0.0001;
 
 bool has_gyro;
 sensor_msgs::Imu filtered_imu;
@@ -45,6 +49,7 @@ double gyro_offset;
 int gyro_offset_samples;
 double accelerometer_offset;
 bool positioning_initialized = false;
+bool amcl_initialized = false;
 
 ros::Time last_gps_fixed_time(0.0), last_gps_float_time(0.0), last_gps_fully_fixed_time(0.0);
 nav_msgs::Odometry last_odometry;
@@ -56,9 +61,12 @@ ros::ServiceClient positioningClientMap, positioningClientOdom;
 
 bool gps_enabled = true;
 
-bool setGpsState(mower_utils::GPSControlSrvRequest &req, mower_utils::GPSControlSrvResponse &res) {
+bool setGpsState(robot_localization_om::GPSControlSrvRequest &req, robot_localization_om::GPSControlSrvResponse &res) {
     gps_enabled = req.gps_enabled;
     last_gps_float_time = ros::Time::now();
+    if (!gps_enabled) {
+        amcl_initialized = false;
+    }
     return true;
 }
 
@@ -75,14 +83,17 @@ void setRobotPose(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr &new_
         ROS_ERROR_STREAM("Error setting robot pose (map) to " << loc_pose_srv.request.pose << ". Retrying.");
         retry_delay.sleep();
     }
-    loc_pose_srv.request.pose.header.frame_id = "odom";
-    for(int i = 0; i < 10; i++) {
-        if(positioningClientOdom.call(loc_pose_srv)) {
-            break;
+    if (useOdomFrame) {
+        loc_pose_srv.request.pose.header.frame_id = "odom";
+        for(int i = 0; i < 10; i++) {
+            if(positioningClientOdom.call(loc_pose_srv)) {
+                break;
+            }
+            ROS_ERROR_STREAM("Error setting robot pose (odom) to " << loc_pose_srv.request.pose << ". Retrying.");
+            retry_delay.sleep();
         }
-        ROS_ERROR_STREAM("Error setting robot pose (odom) to " << loc_pose_srv.request.pose << ". Retrying.");
-        retry_delay.sleep();
     }
+    ROS_INFO_STREAM_THROTTLE(1, "odom_converter: setting amcl initial pose to " << new_pose->pose);
     geometry_msgs::PoseWithCovarianceStamped pose;
     pose.header.frame_id = "map";
     pose.header.stamp = ros::Time::now();
@@ -90,26 +101,8 @@ void setRobotPose(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr &new_
     amcl_initial_publisher.publish(pose);
 }
 
-bool setPoseFromService(mower_utils::SetPoseSrvRequest &req, mower_utils::SetPoseSrvResponse &res) {
-    geometry_msgs::PoseWithCovarianceStamped new_pose;
-    new_pose.header.frame_id = "map";
-    new_pose.header.stamp = ros::Time::now();
-    new_pose.pose.pose.position.x = req.robot_pose.position.x;
-    new_pose.pose.pose.position.y = req.robot_pose.position.y;
-    new_pose.pose.pose.position.z = req.robot_pose.position.z;
-    new_pose.pose.pose.orientation.x = req.robot_pose.orientation.x;
-    new_pose.pose.pose.orientation.y = req.robot_pose.orientation.y;
-    new_pose.pose.pose.orientation.z = req.robot_pose.orientation.z;
-    new_pose.pose.pose.orientation.w = req.robot_pose.orientation.w;
-    new_pose.pose.covariance[0] = 0.01;
-    new_pose.pose.covariance[7] = 0.01;
-    new_pose.pose.covariance[14] = 0.01;
-    new_pose.pose.covariance[21] = 0.01;
-    new_pose.pose.covariance[28] = 0.01;
-    // orientation covariance is incertain in this case because very often this message is received when the robot recovers GPS
-    // and the orientation is not yet accurate because the robot is not moving. So we set it to a high value.
-    new_pose.pose.covariance[35] = 1000.0;
-    geometry_msgs::PoseWithCovarianceStamped::ConstPtr msg_ptr = boost::make_shared<geometry_msgs::PoseWithCovarianceStamped>(new_pose);
+bool setPoseFromService(robot_localization_om::SetPoseSrvRequest &req, robot_localization_om::SetPoseSrvResponse &res) {
+    geometry_msgs::PoseWithCovarianceStamped::ConstPtr msg_ptr = boost::make_shared<geometry_msgs::PoseWithCovarianceStamped>(req.robot_pose);
     setRobotPose(msg_ptr);
     return true;
 }
@@ -121,7 +114,6 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
 
     bool is_fixed = false;
     if ((msg->flags & xbot_msgs::AbsolutePose::FLAG_GPS_RTK_FLOAT) == xbot_msgs::AbsolutePose::FLAG_GPS_RTK_FLOAT) {
-        // if it's float since some time now, increase damping factor
         last_gps_float_time = ros::Time::now();
     } else {
         // when the state has not been updated for a while, the GPS was probably turned off and both float and fixed times are way off
@@ -131,7 +123,10 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
         }
         // if the fixed signal is recovered since more than 10 seconds, and the fixed signal time is recent, then we consider it fixed
         if (last_gps_float_time.isZero() || last_gps_float_time < last_gps_fixed_time) {
-            if ((ros::Time::now() - last_gps_float_time).toSec() > 10.0 && (ros::Time::now() - last_gps_fixed_time).toSec() < 1.0) {
+            auto now = ros::Time::now();
+            auto seconds_since_float = (now - last_gps_float_time).toSec();
+            auto seconds_since_fixed = (now - last_gps_fixed_time).toSec();
+            if ((seconds_since_float > fully_fixed_wait_time) && (seconds_since_fixed < 1.0)) {
                 is_fixed = true;
             }
         }
@@ -157,12 +152,15 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
 
     // compute a damping factor based on the time since the last GPS fix (with a margin so fully fixed)
     double damping = 0.0;
-    if (!last_gps_fixed_time.isZero()) {
+    if (!last_gps_fully_fixed_time.isZero()) {
         damping = float_damping_factor * (ros::Time::now() - last_gps_fully_fixed_time).toSec();
     } else {
         damping = float_damping_factor * 60.0; // if the GPS is not fixed, use a high damping factor
     }
 
+    if (!is_fixed) {
+        ROS_INFO_STREAM_THROTTLE(1, "odom_converter: GPS is float, last fixed " << (ros::Time::now() - last_gps_fixed_time).toSec() << " seconds ago, fully fixed " << (ros::Time::now() - last_gps_fully_fixed_time).toSec() << " seconds ago, damping: " << damping);
+    }
     tf2::Quaternion q;
     double heading = msg->motion_heading;
     // if reversing, flip the heading
@@ -193,7 +191,6 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
         pose_map.pose.position.x -= antenna_offset_x * cos(yaw);
         pose_map.pose.position.y -= antenna_offset_x * sin(yaw);
         pose_map.pose.position.z = 0;
-        // ROS_INFO_STREAM("transform gps to map; gps pose: " << msg->pose.pose << "; map pose: " << pose_map.pose);
     }
     catch (tf2::TransformException &ex) {
         ROS_WARN("om_mower_logic map/base_link: %s", ex.what());
@@ -230,6 +227,8 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
     if (!positioning_initialized) {
         positioning_initialized = true;
         ROS_INFO_STREAM("odom_converter: GPS positioning initialized to " << pose.pose.pose.position.x << ", " << pose.pose.pose.position.y);
+        // orientation covariance is not valid in this case so we set the covariance to a high value (probably not needed because not moving ... but just to be sure)
+        pose.pose.covariance[35] = 1000.0;
         // set the robot pose to the current GPS pose
         geometry_msgs::PoseWithCovarianceStamped::ConstPtr msg_ptr = boost::make_shared<geometry_msgs::PoseWithCovarianceStamped>(pose);
         setRobotPose(msg_ptr);
@@ -251,9 +250,18 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
     if (is_fixed && last_filter_init < ros::Time::now() - ros::Duration(5.0) && last_good_odometry < ros::Time::now() - ros::Duration(10.0)) {
         last_filter_init = ros::Time::now();
         ROS_WARN_STREAM("odom_converter: GPS is fixed but the filter is out of sync. Resetting the filter");
+        // orientation covariance is not valid in this case so we set the covariance to a high value (probably not needed because not moving ... but just to be sure)
+        pose.pose.covariance[35] = 1000.0;
         geometry_msgs::PoseWithCovarianceStamped::ConstPtr msg_ptr = boost::make_shared<geometry_msgs::PoseWithCovarianceStamped>(pose);
         setRobotPose(msg_ptr);
     }
+
+    // initialize AMCL with the GPS pose
+    // if (!amcl_initialized && is_fixed) {
+    //     amcl_initialized = true;
+    //     ROS_INFO_STREAM("odom_converter: AMCL initialized with GPS pose " << pose.pose.pose.position.x << ", " << pose.pose.pose.position.y);
+    //     amcl_initial_publisher.publish(pose);
+    // }
 }
 
 void onWheelTicks(const xbot_msgs::WheelTick::ConstPtr &msg) {
@@ -268,8 +276,6 @@ void onWheelTicks(const xbot_msgs::WheelTick::ConstPtr &msg) {
         return;
     }
 
-    // double d_wheel_l = (double) (msg->wheel_ticks_rl - last_ticks.wheel_ticks_rl) * (1/(double)msg->wheel_tick_factor);
-    // double d_wheel_r = (double) (msg->wheel_ticks_rr - last_ticks.wheel_ticks_rr) * (1/(double)msg->wheel_tick_factor);
     double d_wheel_l = (double) (msg->wheel_ticks_rl - last_ticks.wheel_ticks_rl) * (1/330.0);
     double d_wheel_r = (double) (msg->wheel_ticks_rr - last_ticks.wheel_ticks_rr) * (1/330.0);
 
@@ -284,8 +290,6 @@ void onWheelTicks(const xbot_msgs::WheelTick::ConstPtr &msg) {
     double computed_vx = d_ticks / dt;
 
     last_ticks = *msg;
-
-    // detect wheel sliping
 
     // limit wheel angular speed
     double angular_speed = (d_wheel_r - d_wheel_l)/(dt * 0.33);
@@ -314,16 +318,27 @@ void onWheelTicks(const xbot_msgs::WheelTick::ConstPtr &msg) {
 void onImu(const sensor_msgs::Imu::ConstPtr &msg) {
 
     filtered_imu = *msg;
-    // filtered_imu.angular_velocity.z -= gyro_offset;
-    // filtered_imu.linear_acceleration.x -= accelerometer_offset;
     
-    // covariance factors
-    filtered_imu.linear_acceleration_covariance[0] = filtered_imu.linear_acceleration_covariance[0] * acceleration_covariance_factor;
-    filtered_imu.linear_acceleration_covariance[4] = filtered_imu.linear_acceleration_covariance[4] * acceleration_covariance_factor;
-    filtered_imu.linear_acceleration_covariance[8] = filtered_imu.linear_acceleration_covariance[8] * acceleration_covariance_factor;
-    filtered_imu.angular_velocity_covariance[0] = filtered_imu.angular_velocity_covariance[0] * yaw_covariance_factor;
-    filtered_imu.angular_velocity_covariance[4] = filtered_imu.angular_velocity_covariance[4] * yaw_covariance_factor;
-    filtered_imu.angular_velocity_covariance[8] = filtered_imu.angular_velocity_covariance[8] * yaw_covariance_factor;
+    // covariance factors: adjust the covariance values based on the configuration
+    // sometimes the IMU doens't provide the covariance values, so we use the fixed values
+    if (fixed_acceleration_covariance > 0.0) {
+        filtered_imu.linear_acceleration_covariance[0] = fixed_acceleration_covariance;
+        filtered_imu.linear_acceleration_covariance[4] = fixed_acceleration_covariance;
+        filtered_imu.linear_acceleration_covariance[8] = fixed_acceleration_covariance;
+    } else {
+        filtered_imu.linear_acceleration_covariance[0] = filtered_imu.linear_acceleration_covariance[0] * acceleration_covariance_factor;
+        filtered_imu.linear_acceleration_covariance[4] = filtered_imu.linear_acceleration_covariance[4] * acceleration_covariance_factor;
+        filtered_imu.linear_acceleration_covariance[8] = filtered_imu.linear_acceleration_covariance[8] * acceleration_covariance_factor;
+    }
+    if (fixed_yaw_covariance > 0.0) {
+        filtered_imu.angular_velocity_covariance[0] = fixed_yaw_covariance;
+        filtered_imu.angular_velocity_covariance[4] = fixed_yaw_covariance;
+        filtered_imu.angular_velocity_covariance[8] = fixed_yaw_covariance;
+    } else {
+        filtered_imu.angular_velocity_covariance[0] = filtered_imu.angular_velocity_covariance[0] * yaw_covariance_factor;
+        filtered_imu.angular_velocity_covariance[4] = filtered_imu.angular_velocity_covariance[4] * yaw_covariance_factor;
+        filtered_imu.angular_velocity_covariance[8] = filtered_imu.angular_velocity_covariance[8] * yaw_covariance_factor;
+    }
 
     filtered_imu_pub.publish(filtered_imu);
 }
@@ -338,10 +353,6 @@ void odomReceived(const nav_msgs::Odometry::ConstPtr &msg) {
     open_mower_pose.pose = msg->pose;
     open_mower_pose.position_accuracy = std::sqrt(msg->pose.covariance[0] + msg->pose.covariance[7]);
     open_mower_pose.orientation_accuracy = std::sqrt(msg->pose.covariance[35]);
-//    open_mower_pose.motion_vector.x = msg->twist.twist.linear.x;
-//    open_mower_pose.motion_vector.y = msg->twist.twist.linear.y;
-//    open_mower_pose.motion_heading = tf2::getYaw(msg->pose.pose.orientation);
-//    open_mower_pose.motion_angular_velocity = msg->twist.twist.angular.z;
     open_mower_pose.flags = 0;
 
     if (last_odometry.pose.covariance[0] < max_covariance && last_odometry.pose.covariance[7] < max_covariance) {
@@ -394,11 +405,6 @@ int main(int argc, char **argv) {
     amcl_initial_publisher = n.advertise<geometry_msgs::PoseWithCovarianceStamped>("/amcl_initial", 1, true);
     amcl_filtered_publisher = paramNh.advertise<geometry_msgs::PoseWithCovarianceStamped>("amcl_pose", 1, true);
 
-    positioningClientMap = n.serviceClient<robot_localization::SetPose>(
-        "odometry_map/set_pose");
-    positioningClientOdom = n.serviceClient<robot_localization::SetPose>(
-        "odometry_odom/set_pose");
-
     paramNh.param("cov_factor_pos", cov_factor_pos, 10.0);
     paramNh.param("cov_factor_ori", cov_factor_ori, 100.0);
     paramNh.param("cov_factor_float_pos", cov_factor_float_pos, 500.0);
@@ -412,7 +418,17 @@ int main(int argc, char **argv) {
     paramNh.param("acceleration_covariance_factor", acceleration_covariance_factor, 100.0);
     paramNh.param("yaw_covariance_factor", yaw_covariance_factor, 100.0);
     paramNh.param("amcl_covariance_factor", amcl_covariance_factor, 10.0);
+    paramNh.param("use_odom_frame", useOdomFrame, false);
+    paramNh.param("fully_fixed_wait_time", fully_fixed_wait_time, 20.0);
+    paramNh.param("fixed_yaw_covariance", fixed_yaw_covariance, 0.0001);
+    paramNh.param("fixed_acceleration_covariance", fixed_acceleration_covariance, 0.0001);
 
+    positioningClientMap = n.serviceClient<robot_localization::SetPose>(
+        "odometry_map/set_pose");
+    if (useOdomFrame) {
+        positioningClientOdom = n.serviceClient<robot_localization::SetPose>(
+            "odometry_odom/set_pose");
+    }
 
     ros::ServiceServer gps_service = n.advertiseService("odom_converter/set_gps_state", setGpsState);
     ros::ServiceServer pose_service = n.advertiseService("odom_converter/set_robot_pose", setPoseFromService);
