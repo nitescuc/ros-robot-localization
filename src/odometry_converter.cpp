@@ -54,6 +54,8 @@ bool amcl_initialized = false;
 ros::Time last_gps_fixed_time(0.0), last_gps_float_time(0.0), last_gps_fully_fixed_time(0.0);
 nav_msgs::Odometry last_odometry;
 ros::Time last_filter_init(0.0), last_good_odometry(0.0);
+// Throttle publishing of pose when GPS is not RTK fixed (max ~2 Hz)
+ros::Time last_unfixed_pose_publish(0.0);
 
 std::recursive_mutex odom_mutex;
 
@@ -233,7 +235,20 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
         geometry_msgs::PoseWithCovarianceStamped::ConstPtr msg_ptr = boost::make_shared<geometry_msgs::PoseWithCovarianceStamped>(pose);
         setRobotPose(msg_ptr);
     }
-    pose_pub.publish(pose);
+    // Publish pose:
+    // If GPS is fixed, always publish.
+    // If GPS is NOT fixed, publish at most at 2 Hz (every 0.5s) to reduce noisy updates.
+    if (is_fixed) {
+        pose_pub.publish(pose);
+    } else {
+        ros::Time now = ros::Time::now();
+        if (last_unfixed_pose_publish.isZero() || (now - last_unfixed_pose_publish).toSec() >= 0.5) {
+            pose_pub.publish(pose);
+            last_unfixed_pose_publish = now;
+        } else {
+            ROS_DEBUG_STREAM_THROTTLE(2, "odom_converter: Skipping unfixed pose publish to throttle rate (<2Hz)");
+        }
+    }
 
     // publish odometry only if the speed is relevant
     if(is_moving) {
