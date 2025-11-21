@@ -163,13 +163,13 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
     }
 
     if (!is_fixed) {
-        ROS_INFO_STREAM_THROTTLE(1, "odom_converter: GPS is float, last fixed " << (ros::Time::now() - last_gps_fixed_time).toSec() << " seconds ago, fully fixed " << (ros::Time::now() - last_gps_fully_fixed_time).toSec() << " seconds ago, damping: " << damping);
+        // ROS_INFO_STREAM_THROTTLE(1, "odom_converter: GPS is float, last fixed " << (ros::Time::now() - last_gps_fixed_time).toSec() << " seconds ago, fully fixed " << (ros::Time::now() - last_gps_fully_fixed_time).toSec() << " seconds ago, damping: " << damping);
     }
     tf2::Quaternion q;
     double heading = msg->motion_heading;
     // if reversing, flip the heading
     if (is_reversing) {
-        ROS_INFO_STREAM_THROTTLE(1, "odom_converter: reversing: " << vx);
+        // ROS_INFO_STREAM_THROTTLE(1, "odom_converter: reversing: " << vx);
         heading += M_PI;
         if (heading > 2*M_PI) {
             heading -= 2*M_PI;
