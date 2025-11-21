@@ -23,6 +23,7 @@ nav_msgs::Odometry odometry;
 geometry_msgs::PoseWithCovarianceStamped pose;
 std::string odometry_frame_id = "odom";
 double vx = 0.0;
+bool is_reversing = false;
 
 double cov_factor_pos = 10;
 double cov_factor_ori = 100;
@@ -41,6 +42,7 @@ double fully_fixed_wait_time = 20.0; // seconds
 bool useOdomFrame = false;
 double fixed_yaw_covariance = 0.0001;
 double fixed_acceleration_covariance = 0.0001;
+double wheel_ticks_per_m = 285.0;
 
 bool has_gyro;
 sensor_msgs::Imu filtered_imu;
@@ -166,7 +168,7 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
     tf2::Quaternion q;
     double heading = msg->motion_heading;
     // if reversing, flip the heading
-    if ((abs(vx) < 1) && (vx < 0.0)) {
+    if (is_reversing) {
         ROS_INFO_STREAM_THROTTLE(1, "odom_converter: reversing: " << vx);
         heading += M_PI;
         if (heading > 2*M_PI) {
@@ -291,15 +293,16 @@ void onWheelTicks(const xbot_msgs::WheelTick::ConstPtr &msg) {
         return;
     }
 
-    double d_wheel_l = (double) (msg->wheel_ticks_rl - last_ticks.wheel_ticks_rl) * (1/330.0);
-    double d_wheel_r = (double) (msg->wheel_ticks_rr - last_ticks.wheel_ticks_rr) * (1/330.0);
-
+    double d_wheel_l = (double) (msg->wheel_ticks_rl - last_ticks.wheel_ticks_rl) * (1/wheel_ticks_per_m);
+    double d_wheel_r = (double) (msg->wheel_ticks_rr - last_ticks.wheel_ticks_rr) * (1/wheel_ticks_per_m);
+    
     if(msg->wheel_direction_rl) {
         d_wheel_l *= -1.0;
     }
     if(msg->wheel_direction_rr) {
         d_wheel_r *= -1.0;
     }
+    is_reversing = msg->wheel_direction_rl && msg->wheel_direction_rr;
 
     double d_ticks = (d_wheel_l + d_wheel_r) / 2.0;
     double computed_vx = d_ticks / dt;
@@ -437,6 +440,7 @@ int main(int argc, char **argv) {
     paramNh.param("fully_fixed_wait_time", fully_fixed_wait_time, 20.0);
     paramNh.param("fixed_yaw_covariance", fixed_yaw_covariance, 0.0001);
     paramNh.param("fixed_acceleration_covariance", fixed_acceleration_covariance, 0.0001);
+    paramNh.param("wheel_ticks_per_m", wheel_ticks_per_m, 280.0);
 
     positioningClientMap = n.serviceClient<robot_localization::SetPose>(
         "odometry_map/set_pose");
