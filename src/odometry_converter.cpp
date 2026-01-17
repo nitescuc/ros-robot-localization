@@ -167,16 +167,26 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
     }
     tf2::Quaternion q;
     // compute heading from motion vector
-    double heading = std::atan2(msg->motion_vector.y, msg->motion_vector.x);
+    double heading = msg->msg->motion_heading;
+    // double heading = std::atan2(msg->motion_vector.y, msg->motion_vector.x);
     // if reversing, flip the heading
-    // if (is_reversing) {
-    //     // ROS_INFO_STREAM_THROTTLE(1, "odom_converter: reversing: " << vx);
-    //     heading += M_PI;
-    //     if (heading > 2*M_PI) {
-    //         heading -= 2*M_PI;
-    //     }
-    // }
+    if (is_reversing) {
+        // ROS_INFO_STREAM_THROTTLE(1, "odom_converter: reversing: " << vx);
+        heading += M_PI;
+        if (heading > 2*M_PI) {
+            heading -= 2*M_PI;
+        }
+    }
     q.setRPY(0, 0, heading);
+    double orientation_covariance = msg->orientation_accuracy * msg->orientation_accuracy;
+    if (orientation_covariance <= 0.0) {
+        // take pose covariance instead
+        orientation_covariance = msg->pose.covariance[0];
+    }
+    if (orientation_covariance <= 0.0) {
+        // put some default value
+        orientation_covariance = 0.1;
+    }
 
     // convert pose from "gps" frame to "map" frame
     geometry_msgs::PoseStamped pose_map;
@@ -218,12 +228,12 @@ void onGPS(const xbot_msgs::AbsolutePose::ConstPtr &msg) {
         pose.pose.covariance[0] = pose.pose.covariance[0] * cov_factor_pos;
         pose.pose.covariance[7] = pose.pose.covariance[7] * cov_factor_pos;
         pose.pose.covariance[14] = pose.pose.covariance[14] * cov_factor_pos;
-        pose.pose.covariance[35] = msg->orientation_accuracy * msg->orientation_accuracy * cov_factor_ori;
+        pose.pose.covariance[35] = orientation_covariance * cov_factor_ori;
     } else {
         pose.pose.covariance[0] = pose.pose.covariance[0] * (cov_factor_float_pos + damping);
         pose.pose.covariance[7] = pose.pose.covariance[7] * (cov_factor_float_pos + damping);
         pose.pose.covariance[14] = pose.pose.covariance[14] * (cov_factor_float_pos + damping);
-        pose.pose.covariance[35] = msg->orientation_accuracy * msg->orientation_accuracy * cov_factor_float_ori;
+        pose.pose.covariance[35] = orientation_covariance * cov_factor_float_ori;
     }
     if (!is_moving) {
         pose.pose.covariance[35] = 1000.0;
@@ -328,8 +338,12 @@ void onWheelTicks(const xbot_msgs::WheelTick::ConstPtr &msg) {
     
     odometry.twist.twist.linear.x = vx;
     odometry.twist.twist.angular.z = angular_speed;
-    odometry.twist.covariance[0] = 0.01;
-    odometry.twist.covariance[35] = 0.05;
+    odometry.twist.covariance[0] = 0.05;
+    odometry.twist.covariance[7] = 0.05;
+    odometry.twist.covariance[14] = 1000;
+    odometry.twist.covariance[21] = 1000;
+    odometry.twist.covariance[28] = 1000;
+    odometry.twist.covariance[35] = 0.02;
 
     odometry_pub.publish(odometry);
 }
@@ -343,15 +357,15 @@ void onImu(const sensor_msgs::Imu::ConstPtr &msg) {
     if (fixed_acceleration_covariance > 0.0) {
         filtered_imu.linear_acceleration_covariance[0] = fixed_acceleration_covariance;
         filtered_imu.linear_acceleration_covariance[4] = fixed_acceleration_covariance;
-        filtered_imu.linear_acceleration_covariance[8] = fixed_acceleration_covariance;
+        filtered_imu.linear_acceleration_covariance[8] = 1000.0;
     } else {
         filtered_imu.linear_acceleration_covariance[0] = filtered_imu.linear_acceleration_covariance[0] * acceleration_covariance_factor;
         filtered_imu.linear_acceleration_covariance[4] = filtered_imu.linear_acceleration_covariance[4] * acceleration_covariance_factor;
         filtered_imu.linear_acceleration_covariance[8] = filtered_imu.linear_acceleration_covariance[8] * acceleration_covariance_factor;
     }
     if (fixed_yaw_covariance > 0.0) {
-        filtered_imu.angular_velocity_covariance[0] = fixed_yaw_covariance;
-        filtered_imu.angular_velocity_covariance[4] = fixed_yaw_covariance;
+        filtered_imu.angular_velocity_covariance[0] = 1000.0;
+        filtered_imu.angular_velocity_covariance[4] = 1000.0;
         filtered_imu.angular_velocity_covariance[8] = fixed_yaw_covariance;
     } else {
         filtered_imu.angular_velocity_covariance[0] = filtered_imu.angular_velocity_covariance[0] * yaw_covariance_factor;
